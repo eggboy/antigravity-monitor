@@ -122,21 +122,3 @@ npm test
 ```
 
 The test suite in `test/agy-menubar.test.ts` builds isolated SQLite and JSONL fixtures in temporary directories without touching `~/.gemini/`.
-
-## Releasing
-
-The menu footer shows the running version and links to [`CHANGELOG.md`](CHANGELOG.md).
-
-Add your release notes to `CHANGELOG.md` first (keep one unwrapped line per paragraph so GitHub Releases preserves GFM line breaks), then bump the version:
-
-```bash
-npm version patch   # or: minor / major
-```
-
-`npm version` runs `lint`, `typecheck`, and `test`, updates `package.json`, syncs `<xbar.version>` in `scripts/agy-monitor.5s.sh`, commits, and tags the release. Push the tag and publish the GitHub release from `CHANGELOG.md`:
-
-```bash
-git push --follow-tags
-gh release create "v$(node -p 'require("./package.json").version')" \
-  --notes-file <(npm run --silent release-notes)
-```
