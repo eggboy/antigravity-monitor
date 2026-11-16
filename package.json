@@ -1,0 +1,36 @@
+{
+  "name": "agy-monitor",
+  "version": "0.1.0",
+  "description": "A macOS menu bar plugin that shows real-time status of Antigravity (agy) and Jetski sessions across desktop IDE, CLI, headless runs, subagents, and swarms. Built for SwiftBar and xbar.",
+  "private": true,
+  "scripts": {
+    "lint": "npm run lint:ts && npm run lint:shell",
+    "lint:ts": "eslint 'scripts/**/*.ts' 'test/**/*.ts'",
+    "lint:fix": "eslint 'scripts/**/*.ts' 'test/**/*.ts' --fix",
+    "lint:shell": "find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck",
+    "typecheck": "tsc --noEmit",
+    "test": "node --no-warnings --test test/agy-menubar.test.ts",
+    "release-notes": "./scripts/release-notes.sh",
+    "sync-version": "sed -i '' \"s|<xbar.version>.*</xbar.version>|<xbar.version>${npm_package_version}</xbar.version>|\" scripts/agy-monitor.5s.sh",
+    "preversion": "npm run lint && npm run typecheck && npm test",
+    "version": "npm run sync-version && git add scripts/agy-monitor.5s.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eggboy/agy-monitor.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/eggboy/agy-monitor/issues"
+  },
+  "homepage": "https://github.com/eggboy/agy-monitor#readme",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.9.2",
+    "eslint": "^10.4.1",
+    "globals": "^17.6.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.60.1"
+  }
+}
