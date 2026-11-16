@@ -1,8 +1,8 @@
-# Agy Monitor
-
-`agy-monitor` is a macOS menu bar plugin for [SwiftBar](https://github.com/swiftbar/SwiftBar) and [xbar](https://xbarapp.com) that tracks live Antigravity (`agy`) and Jetski (`jetski`) sessions. You can watch desktop IDE windows, CLI terminals, headless runs, subagents, and swarms from one dropdown, following the design of [`eggboy/copilotcli-monitor`](https://github.com/eggboy/copilotcli-monitor).
+# Antigravity Monitor
 
 ![menubar](https://img.shields.io/badge/macOS-menu%20bar-blue)
+
+`agy-monitor` is a macOS menu bar plugin for [SwiftBar](https://github.com/swiftbar/SwiftBar) and [xbar](https://xbarapp.com) that tracks live Antigravity (`agy`) and Jetski (`jetski`) sessions. You can watch desktop IDE windows, CLI terminals, headless runs, subagents, and swarms from one dropdown, following the design of [`eggboy/copilotcli-monitor`](https://github.com/eggboy/copilotcli-monitor).
 
 ## What It Shows
 
