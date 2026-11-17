@@ -16,7 +16,11 @@ import { inflateSync } from 'node:zlib';
 
 import {
   AGY_ICON,
+  CACHE_VERSION,
   RESERVED_CACHE_FILES,
+  canonicalModelInfo,
+  canonicalModelKey,
+  cleanApiErrorMessage,
   discoverSessions,
   emit,
   extractModelFromBlob,
@@ -30,6 +34,7 @@ import {
   processTranscriptEvent,
   pruneCache,
   readPinnedId,
+  readQuotasCache,
   readRootSummaries,
   resolveConfig,
   resolveWorkspaceInfo,
@@ -1209,5 +1214,427 @@ describe('agy-menubar hermetic suite', () => {
       menuBarBadge([recentSession], recentSession, errStats, now),
       { label: '🟠', params: 'size=14' },
     );
+  });
+
+  it('cleans API error URL/retry prefixes and maps slug + display model variants to canonical keys', () => {
+    assert.equal(CACHE_VERSION, 4);
+
+    assert.equal(
+      cleanApiErrorMessage(
+        'API error (attempt 8): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host',
+      ),
+      'dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host (#8)',
+    );
+    assert.equal(
+      cleanApiErrorMessage(
+        'API error (attempt 1): request failed: Get "http://localhost:8080/test": connection refused',
+      ),
+      'connection refused',
+    );
+    assert.equal(
+      cleanApiErrorMessage(
+        'API error (attempt 3): RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity on this model.',
+      ),
+      '429: You have exhausted your capacity on this model. (#3)',
+    );
+    assert.equal(
+      cleanApiErrorMessage('RESOURCE_EXHAUSTED: Quota exceeded for quota metric'),
+      'Quota exhausted: Quota exceeded for quota metric',
+    );
+
+    // Object evt.error support in processTranscriptEvent
+    const objErrStats = freshStats();
+    processTranscriptEvent(objErrStats, {
+      step_index: 4,
+      type: 'ERROR_MESSAGE',
+      created_at: '2026-11-17T11:00:00Z',
+      error: {
+        status: 'RESOURCE_EXHAUSTED',
+        code: 429,
+        message: 'You have exhausted your quota on this model.',
+      },
+    });
+    assert.equal(objErrStats.apiErrors.length, 1);
+    assert.equal(objErrStats.apiErrors[0].isQuota, true);
+    assert.equal(
+      objErrStats.apiErrors[0].message,
+      '429: You have exhausted your quota on this model.',
+    );
+
+    // Canonical slug <-> display-name equivalence
+    const pairs: Array<[string, string]> = [
+      ['gemini-4-carbon-high', 'Gemini 4 Carbon (High)'],
+      ['opus-5.5-high', 'Claude Opus 5.5 (High)'],
+      ['fable-5.2-xhigh', 'Claude Fable 5.2 (XHigh)'],
+      ['gemini-launch-candidate-high', 'Gemini 4 Argon (High)'],
+      ['hydrogen-l-tf-high', 'Gemini 4 Hydrogen (High)'],
+      ['gemini-3.8-flash-high', 'Gemini 3.8 Flash (High)'],
+      ['gemini-3.5-flash-lite', 'Gemini 3.5 Flash Lite'],
+      ['gemini-pro-coordinator', 'Gemini Pro Orchestrator'],
+      ['auto', 'Gemini Pro Next'],
+    ];
+    for (const [slug, display] of pairs) {
+      assert.equal(
+        canonicalModelKey(slug),
+        canonicalModelKey(display),
+        `Expected ${slug} and ${display} to share canonical key`,
+      );
+      assert.equal(canonicalModelInfo(slug).label, display);
+    }
+  });
+
+  it('hides recovered transient API errors while surfacing recent quota hits and deduplicated unresolved errors with model name', () => {
+    const base = makeTempDir();
+    const rootDir = join(base, 'jetski');
+    const stateDir = join(base, 'state');
+    const now = Date.parse('2026-11-17T10:30:00Z');
+    const convId = 'errfilter-0000-0000-0000-000000000001';
+
+    createSummaryDb(rootDir, [
+      {
+        conversation_id: convId,
+        title: 'API Alert Filter Session',
+        step_count: 8,
+        status: 'CASCADE_RUN_STATUS_RUNNING',
+        not_fully_idle: 1,
+        last_modified_time: '2026-11-17 10:29:55+00:00',
+      },
+    ]);
+    createConvMetadataDb(
+      rootDir,
+      convId,
+      Buffer.from('\x00\x16Gemini 4 Carbon (High)\x00', 'utf-8'),
+    );
+
+    // 1) Step 1: transient DNS error that will be recovered by step 4 -> MUST BE HIDDEN
+    // 2) Step 2: old quota error (> 60m ago) recovered by step 4 -> MUST BE HIDDEN
+    // 3) Step 3: recent quota error (20m ago) recovered by step 4 -> MUST STAY VISIBLE (< 60m)
+    // 4) Step 4: assistant turn recovers session!
+    writeTranscript(rootDir, convId, [
+      {
+        step_index: 1,
+        type: 'ERROR_MESSAGE',
+        created_at: '2026-11-17T08:00:00Z',
+        error:
+          'API error (attempt 4): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": dial tcp: i/o timeout',
+      },
+      {
+        step_index: 2,
+        type: 'ERROR_MESSAGE',
+        created_at: '2026-11-17T08:30:00Z',
+        error: 'RESOURCE_EXHAUSTED (code 429): Stale quota hit over an hour ago',
+      },
+      {
+        step_index: 3,
+        type: 'ERROR_MESSAGE',
+        created_at: '2026-11-17T10:10:14Z',
+        error:
+          'API error: request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent": RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity on this model.',
+      },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T10:15:00Z',
+        input_tokens: 2000,
+        cache_read_tokens: 1000,
+        output_tokens: 300,
+        tool_calls: [],
+      },
+    ]);
+
+    const recoveredLines: string[] = [];
+    runMonitor(
+      [],
+      { roots: [rootDir], stateDir, lsofOutputOverride: '', now },
+      (l) => recoveredLines.push(l),
+    );
+    const recoveredOut = recoveredLines.join('\n');
+
+    // Transient step-1 timeout and >60m step-2 quota error are hidden; recent step-3 quota stays visible with model
+    assert.ok(!recoveredOut.includes('i/o timeout'));
+    assert.ok(!recoveredOut.includes('Stale quota hit'));
+    assert.match(recoveredOut, /⚠️ API \/ Quota Alerts \(1\)/);
+    assert.match(
+      recoveredOut,
+      /\[QUOTA · Gemini 4 Carbon \(High\)\] 429: You have exhausted your capacity on this model\./,
+    );
+
+    // Now append consecutive unresolved retry attempts at step 5..6 -> deduplicated to latest (#8)
+    const trPath = join(rootDir, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
+    const retries = [
+      JSON.stringify({
+        step_index: 5,
+        type: 'ERROR_MESSAGE',
+        created_at: '2026-11-17T10:29:50Z',
+        error:
+          'API error (attempt 2): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host',
+      }),
+      JSON.stringify({
+        step_index: 6,
+        type: 'ERROR_MESSAGE',
+        created_at: '2026-11-17T10:29:55Z',
+        error:
+          'API error (attempt 8): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": dial tcp: lookup daily-cloudcode-pa.googleapis.com: no such host',
+      }),
+    ].join('\n');
+    writeFileSync(trPath, `${retries}\n`, { flag: 'a' });
+    const bump = new Date(now + 5000);
+    utimesSync(trPath, bump, bump);
+
+    const unresolvedLines: string[] = [];
+    runMonitor(
+      [],
+      { roots: [rootDir], stateDir, lsofOutputOverride: '', now },
+      (l) => unresolvedLines.push(l),
+    );
+    const unresolvedOut = unresolvedLines.join('\n');
+
+    // Only 2 alerts total: recent quota + deduplicated latest (#8) DNS error
+    assert.match(unresolvedOut, /⚠️ API \/ Quota Alerts \(2\)/);
+    assert.match(
+      unresolvedOut,
+      /\[Gemini 4 Carbon \(High\)\] dial tcp: lookup daily-cloudcode-pa\.googleapis\.com: no such host \(#8\)/,
+    );
+    assert.ok(!unresolvedOut.includes('(#2)'));
+  });
+
+  it('aggregates 24h model usage across parent/child/recent sessions and attaches unexpired swarm quotas from truncated transcripts', () => {
+    const base = makeTempDir();
+    const rootDir = join(base, 'jetski');
+    const stateDir = join(base, 'state');
+    const now = Date.parse('2026-11-17T12:00:00Z');
+
+    const parentId = 'usage-parent-0000-0000-0000-000000000001';
+    const childId = 'usage-child-0000-0000-0000-000000000002';
+    const recentClaudeId = 'usage-claude-0000-0000-0000-000000000003';
+    const swarmQuotaId = 'usage-quotas-0000-0000-0000-000000000004';
+    const staleOldId = 'usage-stale-0000-0000-0000-000000000005';
+
+    createSummaryDb(rootDir, [
+      {
+        conversation_id: parentId,
+        title: 'Primary Carbon Session',
+        step_count: 4,
+        last_modified_time: '2026-11-17 11:55:00+00:00',
+      },
+      {
+        conversation_id: childId,
+        title: 'Carbon Swarm Worker',
+        parent_conversation_id: parentId,
+        nesting_depth: 1,
+        step_count: 2,
+        last_modified_time: '2026-11-17 11:50:00+00:00',
+      },
+      {
+        conversation_id: recentClaudeId,
+        title: 'Recent Fable Session',
+        step_count: 3,
+        last_modified_time: '2026-11-17 10:00:00+00:00',
+      },
+      {
+        conversation_id: swarmQuotaId,
+        title: 'Recent Lite Session With Swarm Models',
+        step_count: 3,
+        last_modified_time: '2026-11-17 11:40:00+00:00',
+      },
+      {
+        // > 24h old -> excluded from 24h recent scan
+        conversation_id: staleOldId,
+        title: 'Two Days Ago Session',
+        step_count: 2,
+        last_modified_time: '2026-11-15 08:00:00+00:00',
+      },
+    ]);
+
+    // Parent has display name 'Gemini 4 Carbon (High)'; child has slug 'gemini-4-carbon-high'
+    createConvMetadataDb(
+      rootDir,
+      parentId,
+      Buffer.from('\x00\x16Gemini 4 Carbon (High)\x00', 'utf-8'),
+    );
+    const swarmDir = join(rootDir, 'brain', parentId, '.system_generated', 'swarm');
+    mkdirSync(swarmDir, { recursive: true });
+    writeFileSync(
+      join(swarmDir, 'members.json'),
+      JSON.stringify({
+        title: 'Impl Swarm',
+        members: {
+          'worker-1': {
+            conversation_id: childId,
+            role: 'worker',
+            phase: 'WAITING',
+            applied_model: 'gemini-4-carbon-high',
+          },
+        },
+      }),
+    );
+
+    createConvMetadataDb(
+      rootDir,
+      recentClaudeId,
+      Buffer.from('\x00\x18Claude Fable 5.2 (XHigh)\x00', 'utf-8'),
+    );
+    createConvMetadataDb(
+      rootDir,
+      swarmQuotaId,
+      Buffer.from('\x00\x15Gemini 3.5 Flash Lite\x00', 'utf-8'),
+    );
+    createConvMetadataDb(
+      rootDir,
+      staleOldId,
+      Buffer.from('\x00\x16Claude Opus 5.5 (High)\x00', 'utf-8'),
+    );
+
+    // Parent: 10,000 tok, 2 turns; Child: 5,000 tok, 1 turn -> merged 15.0k tok · 3 turns
+    writeTranscript(rootDir, parentId, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T11:50:00Z',
+        input_tokens: 3000,
+        cache_read_tokens: 2000,
+        output_tokens: 500,
+      },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T11:54:00Z',
+        input_tokens: 2500,
+        cache_read_tokens: 1500,
+        output_tokens: 500,
+      },
+    ]);
+    writeTranscript(rootDir, childId, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T11:49:00Z',
+        input_tokens: 4000,
+        cache_read_tokens: 500,
+        output_tokens: 500,
+      },
+    ]);
+    // Recent Claude Fable session: 8,000 tok, 2 turns
+    writeTranscript(rootDir, recentClaudeId, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T09:55:00Z',
+        input_tokens: 3000,
+        cache_read_tokens: 1000,
+        output_tokens: 0,
+      },
+      {
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T09:59:00Z',
+        input_tokens: 3000,
+        cache_read_tokens: 500,
+        output_tokens: 500,
+      },
+    ]);
+
+    // Swarm models snapshot in non-primary session with <truncated N bytes> mid-JSON:
+    // - gemini-4-carbon-high: 72% unexpired (resets in 2h 15m)
+    // - opus-5.5-high: 4% unexpired (resets in 6h 30m) -> matches Claude Fable via Claude pool!
+    // - hydrogen-l-tf-high: 12% unexpired (<= 20%, unshown Flash family) -> renders ⚠️ low-quota row!
+    // - gemini-3.5-flash-lite: 10% EXPIRED (resets <= now) -> MUST BE IGNORED!
+    const truncatedSwarmContent = [
+      'Created At: 2026-11-17T11:39:00Z',
+      'Completed At: 2026-11-17T11:39:01Z',
+      '',
+      '{"display_names":{"gemini-4-carbon-high":"Gemini 4 Carbon (High)","opus-5.5-high":"Claude Opus 5.5 (High)","hydrogen-l-tf-high":"Gemini 4 Hydrogen (High)","fable-5.2-xhigh":"Claude Fable<truncated 3120 bytes>pus-fragment":"ignored","quotas":{"gemini-4-carbon-high":{"quota_remaining":"72%","quota_resets":"2026-11-17T14:15:00Z"},"opus-5.5-high":{"quota_remaining":"4%","quota_resets":"2026-11-17T18:30:00Z"},"hydrogen-l-tf-high":{"quota_remaining":"12%","quota_resets":"2026-11-17T13:00:00Z"},"gemini-3.5-flash-lite":{"quota_remaining":"10%","quota_resets":"2026-11-17T11:59:00Z"}}}',
+    ].join('\n');
+
+    writeTranscript(rootDir, swarmQuotaId, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-17T11:39:00Z',
+        input_tokens: 1500,
+        cache_read_tokens: 0,
+        output_tokens: 500,
+        tool_calls: [{ name: 'swarm', args: { action: 'models' } }],
+      },
+      {
+        step_index: 2,
+        type: 'GENERIC',
+        source: 'MODEL',
+        created_at: '2026-11-17T11:39:01Z',
+        content: truncatedSwarmContent,
+      },
+    ]);
+
+    // Stale >24h session has 99,000 tokens -> must NOT be aggregated into 24h usage
+    writeTranscript(rootDir, staleOldId, [
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        created_at: '2026-11-15T08:00:00Z',
+        input_tokens: 90000,
+        cache_read_tokens: 9000,
+        output_tokens: 0,
+      },
+    ]);
+
+    const lines: string[] = [];
+    const cfgOverrides = {
+      roots: [rootDir],
+      stateDir,
+      lsofOutputOverride: `p9001\ncjetski-cli\nn${join(rootDir, 'presence', `${parentId}.lock`)}\n`,
+      now,
+    };
+    runMonitor([], cfgOverrides, (l) => lines.push(l));
+    const out = lines.join('\n');
+
+    assert.match(out, /📊 Model Usage \(24h\)/);
+    // Merged parent ('Gemini 4 Carbon (High)') + child ('gemini-4-carbon-high') = 15.0k tok · 3 turns + 72% left
+    assert.match(
+      out,
+      /Gemini 4 Carbon \(High\) — 15\.0k tok · 3 turns · 72% left \(resets in 2h 15m\)/,
+    );
+    // Claude Fable 5.2 (XHigh) inherits shared Claude pool quota from opus-5.5-high (4% left)
+    assert.match(
+      out,
+      /Claude Fable 5\.2 \(XHigh\) — 8\.0k tok · 2 turns · 4% left \(resets in 6h 30m\)/,
+    );
+    // Gemini 3.5 Flash Lite has expired quota_resets (11:59 <= 12:00) -> NO '% left' attached!
+    assert.match(out, /Gemini 3\.5 Flash Lite — 2\.0k tok · 1 turns \|/);
+    // Unshown low-quota Flash pool (hydrogen-l-tf-high = 12% <= 20%) gets compact ⚠️ row
+    assert.match(
+      out,
+      /⚠️ Gemini 4 Hydrogen \(High\) — 12% left \(resets in 1h 0m\)/,
+    );
+    // Stale >24h 99k session was NOT included in Model Usage (24h)
+    const usageStart = out.indexOf('📊 Model Usage (24h)');
+    const usageEnd = out.indexOf('🐝 Swarm:', usageStart);
+    const usageSection = out.slice(usageStart, usageEnd);
+    assert.ok(!usageSection.includes('99.0k tok'));
+    assert.ok(!usageSection.includes('Claude Opus 5.5 (High)'));
+
+    // Verify quotas.json persisted unexpired entries and excluded expired gemini-3.5-flash-lite
+    const persistedQuotas = readQuotasCache(resolveConfig(cfgOverrides).cacheDir);
+    assert.equal(persistedQuotas['gemini-4-carbon-high']?.remainingPct, 72);
+    assert.equal(persistedQuotas['opus-5.5-high']?.remainingPct, 4);
+    assert.equal(persistedQuotas['hydrogen-l-tf-high']?.remainingPct, 12);
+    assert.equal(persistedQuotas['gemini-3.5-flash-lite'], undefined);
+
+    // Warm-tick check (< 80 ms) + expiration check once now >= all quota_resets
+    const warmStart = performance.now();
+    const warmLines: string[] = [];
+    runMonitor([], { ...cfgOverrides, now: now + 15 * 60_000 }, (l) => warmLines.push(l));
+    const warmElapsedMs = performance.now() - warmStart;
+    assert.ok(warmElapsedMs < 80, `Expected warm tick < 80ms, got ${warmElapsedMs.toFixed(1)}ms`);
+    assert.match(warmLines.join('\n'), /72% left \(resets in 2h 0m\)/);
+
+    const postResetLines: string[] = [];
+    runMonitor(
+      [],
+      { ...cfgOverrides, now: Date.parse('2026-11-17T20:00:00Z') },
+      (l) => postResetLines.push(l),
+    );
+    const postResetOut = postResetLines.join('\n');
+    assert.ok(!postResetOut.includes('% left'));
+    assert.deepEqual(readQuotasCache(resolveConfig(cfgOverrides).cacheDir), {});
   });
 });

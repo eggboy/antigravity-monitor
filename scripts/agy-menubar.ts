@@ -50,12 +50,19 @@ export const HEADLESS_ACTIVE_WINDOW_MS = 600_000;
 export const RUNNING_NOW_MAX_AGE_MS = 600_000;
 export const RECENT_IDLE_MAX_AGE_MS = 300_000;
 export const ACTIVE_GAP_CAP_MS = 300_000;
-export const CACHE_VERSION = 2;
+export const CACHE_VERSION = 4;
+
+const MODEL_USAGE_WINDOW_MS = 24 * 3600_000;
+const MAX_USAGE_RECENT_SESSIONS = 40;
+const MAX_MODEL_USAGE_ROWS = 6;
+const LOW_QUOTA_THRESHOLD_PCT = 20;
+const RECENT_QUOTA_ALERT_WINDOW_MS = 60 * 60_000;
 
 export const RESERVED_CACHE_FILES = new Set([
   'presence.json',
   'summaries.json',
   'models.json',
+  'quotas.json',
 ]);
 
 // SwiftBar adaptive colors (light,dark)
@@ -191,6 +198,14 @@ export interface ApiErrorEntry {
   isQuota: boolean;
 }
 
+export interface ModelQuotaEntry {
+  slug: string;
+  displayName: string;
+  remainingPct: number;
+  resets: string;
+  observedAt: string;
+}
+
 export interface SkillInvocation {
   name: string;
   timestamp: string;
@@ -227,6 +242,7 @@ export interface SessionStats {
   toolFailures: ToolIssue[];
   sandboxBlocks: ToolIssue[];
   apiErrors: ApiErrorEntry[];
+  modelQuotas: ModelQuotaEntry[];
   skills: SkillInvocation[];
   mcpUsed: Map<string, number>;
   mcpFailed: Map<string, number>;
@@ -1565,6 +1581,237 @@ export function resolveSessionModel(
   return { model: 'unknown', dirty: false };
 }
 
+export type QuotaPoolFamily = 'claude' | 'gemini-4-pro' | 'gemini-flash';
+
+export interface CanonicalModelInfo {
+  key: string;
+  label: string;
+  isDisplay: boolean;
+}
+
+const MODEL_TIER_LABELS: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max',
+};
+
+const CLAUDE_SUBFAMILIES = new Set(['opus', 'fable', 'sonnet', 'haiku']);
+
+export function canonicalModelInfo(
+  raw: string,
+  displayOverrides?: ReadonlyMap<string, string>,
+): CanonicalModelInfo {
+  const trimmed = raw.trim();
+  if (!trimmed || /^(?:unknown|default)$/i.test(trimmed)) {
+    return { key: 'unknown', label: 'Unknown', isDisplay: false };
+  }
+
+  const base = trimmed.replace(/@[A-Za-z0-9_.-]+$/, '').trim();
+  const lower = base.toLowerCase();
+
+  const override = displayOverrides?.get(lower);
+  if (override && override.toLowerCase() !== lower) {
+    const resolved = canonicalModelInfo(override);
+    return { key: resolved.key, label: override, isDisplay: true };
+  }
+
+  if (lower === 'auto' || /^gemini[- ]pro[- ]next$/i.test(base)) {
+    return {
+      key: 'gemini-pro-next',
+      label: 'Gemini Pro Next',
+      isDisplay: base.includes(' '),
+    };
+  }
+  if (/^gemini[- ]pro[- ](?:coordinator|orchestrator)$/i.test(base)) {
+    return {
+      key: 'gemini-pro-orchestrator',
+      label: 'Gemini Pro Orchestrator',
+      isDisplay: base.includes(' '),
+    };
+  }
+  const argonMatch = /^gemini-launch-candidate(?:-(low|medium|high|xhigh|max))?$/i.exec(base);
+  if (argonMatch) {
+    const tier = argonMatch[1]?.toLowerCase() ?? '';
+    return {
+      key: tier ? `gemini-4-argon-${tier}` : 'gemini-4-argon',
+      label: tier ? `Gemini 4 Argon (${MODEL_TIER_LABELS[tier]})` : 'Gemini 4 Argon',
+      isDisplay: false,
+    };
+  }
+  const hydrogenMatch = /^hydrogen-l-tf(?:-(low|medium|high|xhigh|max))?$/i.exec(base);
+  if (hydrogenMatch) {
+    const tier = hydrogenMatch[1]?.toLowerCase() ?? '';
+    return {
+      key: tier ? `gemini-4-hydrogen-${tier}` : 'gemini-4-hydrogen',
+      label: tier
+        ? `Gemini 4 Hydrogen (${MODEL_TIER_LABELS[tier]})`
+        : 'Gemini 4 Hydrogen',
+      isDisplay: false,
+    };
+  }
+
+  const rawTokens = lower
+    .replace(/[()]/g, ' ')
+    .split(/[\s_-]+/)
+    .filter(Boolean);
+  if (rawTokens.length === 0) {
+    return { key: 'unknown', label: 'Unknown', isDisplay: false };
+  }
+
+  const tokens = CLAUDE_SUBFAMILIES.has(rawTokens[0])
+    ? ['claude', ...rawTokens]
+    : rawTokens;
+  const key = tokens.join('-');
+
+  const looksLikeDisplay = base.includes(' ') || isValidDisplayModelName(base);
+  if (looksLikeDisplay) {
+    return { key, label: base, isDisplay: true };
+  }
+
+  if (/-[A-Z]{1,4}-|Rev\d+/.test(base)) {
+    return { key, label: base, isDisplay: false };
+  }
+
+  const bodyTokens = [...tokens];
+  let tierSuffix = '';
+  if (bodyTokens.length >= 2) {
+    const lastTok = bodyTokens[bodyTokens.length - 1];
+    const tierLabel = MODEL_TIER_LABELS[lastTok];
+    if (tierLabel) {
+      bodyTokens.pop();
+      tierSuffix = ` (${tierLabel})`;
+    }
+  }
+
+  const formattedWords = bodyTokens.map((tok) => {
+    if (tok === 'gpt') return 'GPT';
+    if (/^\d/.test(tok)) return tok;
+    return tok.charAt(0).toUpperCase() + tok.slice(1);
+  });
+  const body =
+    formattedWords[0] === 'GPT' && formattedWords.length === 2 && !tierSuffix
+      ? `${formattedWords[0]}-${formattedWords[1]}`
+      : formattedWords.join(' ');
+
+  return { key, label: `${body}${tierSuffix}`, isDisplay: false };
+}
+
+export function canonicalModelKey(
+  raw: string,
+  displayOverrides?: ReadonlyMap<string, string>,
+): string {
+  return canonicalModelInfo(raw, displayOverrides).key;
+}
+
+export function modelQuotaFamily(raw: string): QuotaPoolFamily | null {
+  const s = raw.toLowerCase();
+  if (/(?:^|[^a-z])(?:claude|opus|fable|sonnet|haiku)(?:$|[^a-z])/.test(s)) {
+    return 'claude';
+  }
+  if (/(?:^|[^a-z])(?:carbon|neon|argon|launch-candidate)(?:$|[^a-z])/.test(s)) {
+    return 'gemini-4-pro';
+  }
+  if (
+    s.includes('3.8-flash') ||
+    s.includes('3.8 flash') ||
+    /(?:^|[^a-z])hydrogen(?:$|[^a-z])/.test(s)
+  ) {
+    return 'gemini-flash';
+  }
+  return null;
+}
+
+export function readQuotasCache(cacheDir: string): Record<string, ModelQuotaEntry> {
+  const p = join(cacheDir, 'quotas.json');
+  if (!existsSync(p)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(p, 'utf-8')) as unknown;
+    if (!isObject(parsed)) return {};
+    const out: Record<string, ModelQuotaEntry> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (!isObject(v)) continue;
+      const slug = typeof v.slug === 'string' ? v.slug.toLowerCase() : k.toLowerCase();
+      const remainingPct = typeof v.remainingPct === 'number' ? v.remainingPct : NaN;
+      const resets = typeof v.resets === 'string' ? v.resets : '';
+      if (!slug || !Number.isFinite(remainingPct) || !resets) continue;
+      out[slug] = {
+        slug,
+        displayName: typeof v.displayName === 'string' ? v.displayName : '',
+        remainingPct,
+        resets,
+        observedAt: typeof v.observedAt === 'string' ? v.observedAt : '',
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function writeQuotasCache(
+  cacheDir: string,
+  map: Record<string, ModelQuotaEntry>,
+): void {
+  ensureCacheDir(cacheDir);
+  try {
+    writeFileSync(join(cacheDir, 'quotas.json'), JSON.stringify(map));
+  } catch {
+    /* best-effort */
+  }
+}
+
+function pruneExpiredQuotas(
+  quotasCache: Record<string, ModelQuotaEntry>,
+  now: number,
+): boolean {
+  let dirty = false;
+  for (const [slug, entry] of Object.entries(quotasCache)) {
+    const resetMs = parseTimestampMs(entry.resets);
+    if (resetMs <= 0 || resetMs <= now) {
+      delete quotasCache[slug];
+      dirty = true;
+    }
+  }
+  return dirty;
+}
+
+function mergeModelQuotas(
+  quotasCache: Record<string, ModelQuotaEntry>,
+  entries: ModelQuotaEntry[],
+  now: number,
+): boolean {
+  let dirty = false;
+  for (const entry of entries) {
+    const resetMs = parseTimestampMs(entry.resets);
+    if (resetMs <= 0 || resetMs <= now) continue;
+
+    const slug = entry.slug.toLowerCase();
+    const prev = quotasCache[slug];
+    const obsMs = parseTimestampMs(entry.observedAt);
+    const prevObsMs = prev ? parseTimestampMs(prev.observedAt) : -1;
+
+    if (!prev || obsMs > prevObsMs) {
+      quotasCache[slug] = { ...entry, slug };
+      dirty = true;
+    } else if (
+      obsMs === prevObsMs &&
+      (prev.remainingPct !== entry.remainingPct ||
+        prev.resets !== entry.resets ||
+        (!prev.displayName && Boolean(entry.displayName)))
+    ) {
+      quotasCache[slug] = {
+        ...entry,
+        slug,
+        displayName: entry.displayName || prev.displayName,
+      };
+      dirty = true;
+    }
+  }
+  return dirty;
+}
+
 // ── Transcript Incremental Parser & Cache ──────────────────────────────
 
 export function freshStats(): SessionStats {
@@ -1591,6 +1838,7 @@ export function freshStats(): SessionStats {
     toolFailures: [],
     sandboxBlocks: [],
     apiErrors: [],
+    modelQuotas: [],
     skills: [],
     mcpUsed: new Map(),
     mcpFailed: new Map(),
@@ -1711,6 +1959,82 @@ function classifyGenericResult(
     exitCode,
     message,
   };
+}
+
+export function extractSwarmQuotaSnapshot(
+  content: string,
+  observedAt: string,
+): ModelQuotaEntry[] {
+  const safe = content.replace(/<truncated\s+\d+\s+bytes>/gi, '\n');
+
+  let effectiveObservedAt = observedAt;
+  if (!effectiveObservedAt) {
+    const completedMatch = /^Completed At:\s*([^\r\n]+)/m.exec(safe);
+    const createdMatch = /^Created At:\s*([^\r\n]+)/m.exec(safe);
+    effectiveObservedAt = completedMatch?.[1]?.trim() || createdMatch?.[1]?.trim() || '';
+  }
+
+  const displayNames = new Map<string, string>();
+  const displayRe =
+    /"([a-z0-9][a-z0-9._-]*)"\s*:\s*"((?:Gemini|Claude|GPT)[^"\r\n]{1,64})"/gi;
+  let dm: RegExpExecArray | null;
+  while ((dm = displayRe.exec(safe)) !== null) {
+    displayNames.set(dm[1].toLowerCase(), dm[2].trim());
+  }
+
+  const bySlug = new Map<string, ModelQuotaEntry>();
+  const quotaRe =
+    /"([a-z0-9][a-z0-9._-]*)"\s*:\s*\{\s*"quota_remaining"\s*:\s*"(\d+)%"\s*,\s*"quota_resets"\s*:\s*"([^"\r\n]+)"\s*\}/gi;
+  let qm: RegExpExecArray | null;
+  while ((qm = quotaRe.exec(safe)) !== null) {
+    const slug = qm[1].toLowerCase();
+    const pct = Number(qm[2]);
+    const resets = qm[3].trim();
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) continue;
+    if (parseTimestampMs(resets) <= 0) continue;
+    const displayName = displayNames.get(slug) ?? canonicalModelInfo(slug).label;
+    bySlug.set(slug, {
+      slug,
+      displayName,
+      remainingPct: pct,
+      resets,
+      observedAt: effectiveObservedAt,
+    });
+  }
+
+  return Array.from(bySlug.values());
+}
+
+export function cleanApiErrorMessage(raw: string): string {
+  let msg = firstLine(raw).trim();
+  if (!msg) return 'API error';
+
+  let attempt = 0;
+  const attemptMatch = /^API error(?:\s*\(attempt\s+(\d+)\))?:\s*/i.exec(msg);
+  if (attemptMatch) {
+    attempt = attemptMatch[1] ? Number(attemptMatch[1]) : 0;
+    msg = msg.slice(attemptMatch[0].length).trim();
+  }
+
+  let prev = '';
+  while (msg !== prev) {
+    prev = msg;
+    msg = msg
+      .replace(/^request failed:\s*/i, '')
+      .replace(/^(?:Post|Get|Put|Delete|Head|Patch)\s+"https?:\/\/[^"]+":\s*/i, '')
+      .trim();
+  }
+
+  msg = msg
+    .replace(/\bRESOURCE_EXHAUSTED\s*\(code\s+(\d+)\):\s*/i, '$1: ')
+    .replace(/\bRESOURCE_EXHAUSTED:\s*/i, 'Quota exhausted: ')
+    .trim();
+
+  if (!msg) msg = 'API error';
+  if (attempt > 1 && !/\(#\d+\)$/.test(msg)) {
+    msg = `${msg} (#${attempt})`;
+  }
+  return msg;
 }
 
 export function processTranscriptEvent(stats: SessionStats, evt: JsonObject): void {
@@ -1850,6 +2174,20 @@ export function processTranscriptEvent(stats: SessionStats, evt: JsonObject): vo
       const errorField = typeof evt.error === 'string' ? evt.error : '';
       const status = typeof evt.status === 'string' ? evt.status : '';
 
+      if (toolName === 'swarm' && content.includes('"quota_remaining"')) {
+        const parsedQuotas = extractSwarmQuotaSnapshot(content, ts);
+        if (parsedQuotas.length > 0) {
+          const bySlug = new Map<string, ModelQuotaEntry>();
+          for (const existing of stats.modelQuotas) {
+            bySlug.set(existing.slug, existing);
+          }
+          for (const q of parsedQuotas) {
+            bySlug.set(q.slug, q);
+          }
+          stats.modelQuotas = Array.from(bySlug.values()).slice(-32);
+        }
+      }
+
       const outcome = classifyGenericResult(content, errorField, status);
       if (outcome.isBackground) {
         stats.backgroundEvents.push({
@@ -1916,21 +2254,40 @@ export function processTranscriptEvent(stats: SessionStats, evt: JsonObject): vo
     case 'ERROR_MESSAGE': {
       stats.pendingTools = [];
       if (stepIndex >= 0) stats.lastApiErrorStep = stepIndex;
-      const errText =
-        typeof evt.error === 'string' && evt.error.trim()
-          ? evt.error.trim()
-          : typeof evt.content === 'string' && evt.content.trim()
-            ? evt.content.trim()
-            : 'API error';
-      const isQuota = /RESOURCE_EXHAUSTED|quota|429|rate.?limit/i.test(errText);
+      let rawErrText = '';
+      if (typeof evt.error === 'string' && evt.error.trim()) {
+        rawErrText = evt.error.trim();
+      } else if (isObject(evt.error)) {
+        const objMsg = typeof evt.error.message === 'string' ? evt.error.message.trim() : '';
+        const objStatus = typeof evt.error.status === 'string' ? evt.error.status.trim() : '';
+        const objCode =
+          typeof evt.error.code === 'number' || typeof evt.error.code === 'string'
+            ? String(evt.error.code).trim()
+            : '';
+        if (objStatus && objCode && objMsg && !objMsg.includes(objStatus)) {
+          rawErrText = `${objStatus} (code ${objCode}): ${objMsg}`;
+        } else if (objStatus && objMsg && !objMsg.includes(objStatus)) {
+          rawErrText = `${objStatus}: ${objMsg}`;
+        } else if (objCode && objMsg && !objMsg.includes(objCode)) {
+          rawErrText = `${objCode}: ${objMsg}`;
+        } else {
+          rawErrText = objMsg || objStatus || objCode;
+        }
+      }
+      if (!rawErrText && typeof evt.content === 'string' && evt.content.trim()) {
+        rawErrText = evt.content.trim();
+      }
+      if (!rawErrText) rawErrText = 'API error';
+
+      const isQuota = /RESOURCE_EXHAUSTED|quota|429|rate.?limit/i.test(rawErrText);
       stats.apiErrors.push({
         ts,
         stepIndex,
-        message: firstLine(errText),
+        message: cleanApiErrorMessage(rawErrText),
         isQuota,
       });
-      if (stats.apiErrors.length > 10) {
-        stats.apiErrors = stats.apiErrors.slice(-10);
+      if (stats.apiErrors.length > 25) {
+        stats.apiErrors = stats.apiErrors.slice(-25);
       }
       break;
     }
@@ -2020,6 +2377,7 @@ function deserializeStats(s: Partial<SerializedSessionStats>): SessionStats {
     toolFailures: s.toolFailures ?? [],
     sandboxBlocks: s.sandboxBlocks ?? [],
     apiErrors: s.apiErrors ?? [],
+    modelQuotas: s.modelQuotas ?? [],
     skills: s.skills ?? [],
     backgroundEvents: s.backgroundEvents ?? [],
   };
@@ -2158,6 +2516,8 @@ export function readSwarmInfo(
   cacheDir: string,
   isRootLive: boolean,
   modelsCache: Record<string, ModelCacheEntry>,
+  statsLoader?: (s: DiscoveredSession) => SessionStats,
+  modelResolver?: (s: DiscoveredSession) => string,
 ): { swarm: SwarmInfo | null; modelsDirty: boolean } {
   const swarmBrainDir =
     existsSync(join(session.brainDir, '.system_generated', 'swarm', 'members.json'))
@@ -2239,15 +2599,21 @@ export function readSwarmInfo(
         rawVal.applied_model || rawVal.model || rawVal.desired_model || '',
       ).trim();
       if (!model && childSession) {
-        const res = resolveSessionModel(childSession, isRootLive, modelsCache);
-        model = res.model;
-        if (res.dirty) modelsDirty = true;
+        if (modelResolver) {
+          model = modelResolver(childSession);
+        } else {
+          const res = resolveSessionModel(childSession, isRootLive, modelsCache);
+          model = res.model;
+          if (res.dirty) modelsDirty = true;
+        }
       }
 
       let toolCalls = 0;
       let totalTokens = 0;
       if (childSession && conversationId !== session.id) {
-        const childStats = loadStats(childSession, cacheDir);
+        const childStats = statsLoader
+          ? statsLoader(childSession)
+          : loadStats(childSession, cacheDir);
         toolCalls = countTotalToolCalls(childStats);
         totalTokens = countTotalTokens(childStats);
       }
@@ -2294,6 +2660,8 @@ export function readSubagents(
   cacheDir: string,
   isRootLive: boolean,
   modelsCache: Record<string, ModelCacheEntry>,
+  statsLoader?: (s: DiscoveredSession) => SessionStats,
+  modelResolver?: (s: DiscoveredSession) => string,
 ): { subagents: SubagentEntry[]; modelsDirty: boolean } {
   const subagentsDir = join(session.brainDir, '.system_generated', 'subagents');
   const byId = new Map<string, SubagentEntry>();
@@ -2366,11 +2734,15 @@ export function readSubagents(
         session.liveness === 'working';
       entry.isActive = childLive;
       entry.isKilled = entry.isKilled || child.killed;
-      const mRes = resolveSessionModel(child, isRootLive, modelsCache);
-      entry.model = mRes.model;
-      if (mRes.dirty) modelsDirty = true;
+      if (modelResolver) {
+        entry.model = modelResolver(child);
+      } else {
+        const mRes = resolveSessionModel(child, isRootLive, modelsCache);
+        entry.model = mRes.model;
+        if (mRes.dirty) modelsDirty = true;
+      }
 
-      const cStats = loadStats(child, cacheDir);
+      const cStats = statsLoader ? statsLoader(child) : loadStats(child, cacheDir);
       entry.toolCalls = countTotalToolCalls(cStats);
       entry.totalTokens = countTotalTokens(cStats);
       const sMs = parseTimestampMs(cStats.startTime);
@@ -2387,7 +2759,9 @@ export function readSubagents(
           brainDir: childBrain,
           childIds: [],
         };
-        const cStats = loadStats(synthChild, cacheDir);
+        const cStats = statsLoader
+          ? statsLoader(synthChild)
+          : loadStats(synthChild, cacheDir);
         entry.toolCalls = countTotalToolCalls(cStats);
         entry.totalTokens = countTotalTokens(cStats);
         entry.durationMs = cStats.activeDurationMs;
@@ -2900,6 +3274,15 @@ export function truncate(s: string, max: number): string {
   return s.slice(0, Math.max(0, max - 1)) + '…';
 }
 
+function truncatePreservingAttempt(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const m = /^(.*?)(\s*\(#\d+\))$/.exec(s);
+  if (m && m[2].length + 2 < max) {
+    return `${truncate(m[1], max - m[2].length)}${m[2]}`;
+  }
+  return truncate(s, max);
+}
+
 export function formatNumber(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
@@ -3032,6 +3415,247 @@ export function clearPinnedId(pinFile: string): void {
   }
 }
 
+// ── Model Usage & API Error Filtering Helpers ──────────────────────────
+
+interface AggregatedModelUsage {
+  key: string;
+  label: string;
+  hasDisplayLabel: boolean;
+  family: QuotaPoolFamily | null;
+  totalTokens: number;
+  turns: number;
+  sessions: number;
+  quota: ModelQuotaEntry | null;
+}
+
+function isNewerQuotaEntry(candidate: ModelQuotaEntry, existing: ModelQuotaEntry): boolean {
+  const cObs = parseTimestampMs(candidate.observedAt);
+  const eObs = parseTimestampMs(existing.observedAt);
+  if (cObs !== eObs) return cObs > eObs;
+  return candidate.remainingPct < existing.remainingPct;
+}
+
+function renderModelUsageSection(
+  candidates: DiscoveredSession[],
+  getStats: (s: DiscoveredSession) => SessionStats,
+  getModel: (s: DiscoveredSession) => string,
+  quotasCache: Record<string, ModelQuotaEntry>,
+  now: number,
+): void {
+  // Load candidate stats first so any opportunistic swarm quota snapshots merge into quotasCache
+  const loaded = candidates.map((s) => ({
+    stats: getStats(s),
+    rawModel: getModel(s),
+  }));
+
+  const unexpiredQuotas = Object.values(quotasCache).filter(
+    (q) => parseTimestampMs(q.resets) > now,
+  );
+
+  const displayOverrides = new Map<string, string>();
+  for (const q of unexpiredQuotas) {
+    if (q.displayName) {
+      displayOverrides.set(q.slug.toLowerCase(), q.displayName);
+    }
+  }
+
+  const quotaByKey = new Map<string, ModelQuotaEntry>();
+  const quotaByFamily = new Map<QuotaPoolFamily, ModelQuotaEntry>();
+  for (const q of unexpiredQuotas) {
+    for (const k of [
+      canonicalModelKey(q.displayName || q.slug, displayOverrides),
+      canonicalModelKey(q.slug, displayOverrides),
+    ]) {
+      const prev = quotaByKey.get(k);
+      if (!prev || isNewerQuotaEntry(q, prev)) {
+        quotaByKey.set(k, q);
+      }
+    }
+    const fam = modelQuotaFamily(q.slug) ?? modelQuotaFamily(q.displayName);
+    if (fam) {
+      const prevFam = quotaByFamily.get(fam);
+      if (!prevFam || isNewerQuotaEntry(q, prevFam)) {
+        quotaByFamily.set(fam, q);
+      }
+    }
+  }
+
+  const groups = new Map<string, AggregatedModelUsage>();
+  for (const { stats, rawModel } of loaded) {
+    const tokens = countTotalTokens(stats);
+    const turns = stats.turnCount.assistant;
+    if (rawModel === 'unknown' && tokens === 0 && turns === 0) continue;
+
+    const info = canonicalModelInfo(rawModel, displayOverrides);
+    const fam =
+      modelQuotaFamily(rawModel) ??
+      modelQuotaFamily(info.key) ??
+      modelQuotaFamily(info.label);
+    const matchedQuota =
+      quotaByKey.get(info.key) ?? (fam ? (quotaByFamily.get(fam) ?? null) : null);
+
+    if (tokens === 0 && turns === 0 && !matchedQuota) continue;
+
+    const existing = groups.get(info.key);
+    if (existing) {
+      existing.totalTokens += tokens;
+      existing.turns += turns;
+      existing.sessions += 1;
+      if (info.isDisplay && !existing.hasDisplayLabel) {
+        existing.label = info.label;
+        existing.hasDisplayLabel = true;
+      }
+      if (!existing.quota && matchedQuota) {
+        existing.quota = matchedQuota;
+      }
+    } else {
+      let label = info.label;
+      let hasDisplayLabel = info.isDisplay;
+      if (
+        !hasDisplayLabel &&
+        matchedQuota?.displayName &&
+        canonicalModelKey(matchedQuota.displayName, displayOverrides) === info.key
+      ) {
+        label = matchedQuota.displayName;
+        hasDisplayLabel = true;
+      }
+      groups.set(info.key, {
+        key: info.key,
+        label,
+        hasDisplayLabel,
+        family: fam,
+        totalTokens: tokens,
+        turns,
+        sessions: 1,
+        quota: matchedQuota,
+      });
+    }
+  }
+
+  const usageRows = Array.from(groups.values())
+    .sort(
+      (a, b) =>
+        b.totalTokens - a.totalTokens ||
+        b.turns - a.turns ||
+        a.label.localeCompare(b.label),
+    )
+    .slice(0, MAX_MODEL_USAGE_ROWS);
+
+  const shownKeys = new Set(usageRows.map((r) => r.key));
+  const shownFamilies = new Set<QuotaPoolFamily>();
+  for (const r of usageRows) {
+    if (r.family) shownFamilies.add(r.family);
+  }
+
+  const lowQuotaPools = new Map<
+    string,
+    { label: string; remainingPct: number; resetMs: number }
+  >();
+  for (const q of unexpiredQuotas) {
+    if (q.remainingPct > LOW_QUOTA_THRESHOLD_PCT) continue;
+    const qInfo = canonicalModelInfo(q.displayName || q.slug, displayOverrides);
+    const fam =
+      modelQuotaFamily(q.slug) ??
+      modelQuotaFamily(q.displayName) ??
+      modelQuotaFamily(qInfo.key);
+    if (shownKeys.has(qInfo.key) || (fam && shownFamilies.has(fam))) continue;
+
+    const poolId = fam ?? qInfo.key;
+    const resetMs = parseTimestampMs(q.resets);
+    const prev = lowQuotaPools.get(poolId);
+    if (!prev || q.remainingPct < prev.remainingPct) {
+      lowQuotaPools.set(poolId, {
+        label: q.displayName || qInfo.label,
+        remainingPct: q.remainingPct,
+        resetMs,
+      });
+    }
+  }
+
+  const lowQuotaRows = Array.from(lowQuotaPools.values()).sort(
+    (a, b) => a.remainingPct - b.remainingPct,
+  );
+
+  // If no sessions had usage/low-quota rows yet, still surface unexpired quota pools if present
+  const fallbackQuotaRows: Array<{ label: string; remainingPct: number; resetMs: number }> = [];
+  if (usageRows.length === 0 && lowQuotaRows.length === 0 && unexpiredQuotas.length > 0) {
+    const seenPools = new Set<string>();
+    for (const q of unexpiredQuotas) {
+      const qInfo = canonicalModelInfo(q.displayName || q.slug, displayOverrides);
+      const fam = modelQuotaFamily(q.slug) ?? modelQuotaFamily(q.displayName);
+      const poolId = fam ?? qInfo.key;
+      if (seenPools.has(poolId)) continue;
+      seenPools.add(poolId);
+      fallbackQuotaRows.push({
+        label: q.displayName || qInfo.label,
+        remainingPct: q.remainingPct,
+        resetMs: parseTimestampMs(q.resets),
+      });
+      if (fallbackQuotaRows.length >= MAX_MODEL_USAGE_ROWS) break;
+    }
+  }
+
+  if (
+    usageRows.length === 0 &&
+    lowQuotaRows.length === 0 &&
+    fallbackQuotaRows.length === 0
+  ) {
+    return;
+  }
+
+  sep();
+  emit('📊 Model Usage (24h)', `size=13 ${CLR_HEAD}`);
+  for (const row of usageRows) {
+    const resetMs = row.quota ? parseTimestampMs(row.quota.resets) : 0;
+    const quotaSuffix =
+      row.quota && resetMs > now
+        ? ` · ${row.quota.remainingPct}% left (resets in ${formatMs(resetMs - now)})`
+        : '';
+    emit(
+      `  ${row.label} — ${formatNumber(row.totalTokens)} tok · ${row.turns} turns${quotaSuffix}`,
+      `size=11 font=Menlo ${CLR_SUB}`,
+    );
+  }
+  for (const lq of lowQuotaRows) {
+    emit(
+      `  ⚠️ ${lq.label} — ${lq.remainingPct}% left (resets in ${formatMs(lq.resetMs - now)})`,
+      `size=11 font=Menlo ${CLR_SUB}`,
+    );
+  }
+  for (const fq of fallbackQuotaRows) {
+    emit(
+      `  ${fq.label} — ${fq.remainingPct}% left (resets in ${formatMs(fq.resetMs - now)})`,
+      `size=11 font=Menlo ${CLR_SUB}`,
+    );
+  }
+}
+
+function filterVisibleApiErrors(stats: SessionStats, now: number): ApiErrorEntry[] {
+  const visible = stats.apiErrors.filter((err) => {
+    const isUnresolved = err.stepIndex >= stats.lastAssistantStep;
+    if (isUnresolved) return true;
+    if (!err.isQuota) return false;
+    const tsMs = parseTimestampMs(err.ts);
+    return tsMs > 0 && now - tsMs <= RECENT_QUOTA_ALERT_WINDOW_MS;
+  });
+
+  const deduped: ApiErrorEntry[] = [];
+  for (const err of visible) {
+    const cleaned = cleanApiErrorMessage(err.message);
+    const base = cleaned.replace(/\s*\(#\d+\)$/, '');
+    const prev = deduped[deduped.length - 1];
+    if (prev) {
+      const prevBase = cleanApiErrorMessage(prev.message).replace(/\s*\(#\d+\)$/, '');
+      if (prevBase === base && prev.isQuota === err.isQuota) {
+        deduped[deduped.length - 1] = { ...err, message: cleaned };
+        continue;
+      }
+    }
+    deduped.push({ ...err, message: cleaned });
+  }
+  return deduped;
+}
+
 // ── Main Render Pipeline ───────────────────────────────────────────────
 
 export function runMonitor(
@@ -3073,14 +3697,36 @@ export function runMonitor(
     const liveRootSet = new Set(discovery.presence.liveRoots);
     const modelsCache = readModelsCache(cfg.cacheDir);
     let modelsCacheDirty = false;
+    const quotasCache = readQuotasCache(cfg.cacheDir);
+    let quotasCacheDirty = pruneExpiredQuotas(quotasCache, cfg.now);
 
-    const primaryStats = loadStats(primary, cfg.cacheDir);
-    const primaryModelRes = resolveSessionModel(
-      primary,
-      liveRootSet.has(primary.rootPath),
-      modelsCache,
-    );
-    if (primaryModelRes.dirty) modelsCacheDirty = true;
+    const statsMemo = new Map<string, SessionStats>();
+    const modelMemo = new Map<string, string>();
+
+    const getStats = (s: DiscoveredSession): SessionStats => {
+      const hit = statsMemo.get(s.id);
+      if (hit) return hit;
+      const loaded = loadStats(s, cfg.cacheDir);
+      statsMemo.set(s.id, loaded);
+      if (loaded.modelQuotas.length > 0) {
+        if (mergeModelQuotas(quotasCache, loaded.modelQuotas, cfg.now)) {
+          quotasCacheDirty = true;
+        }
+      }
+      return loaded;
+    };
+
+    const getModel = (s: DiscoveredSession): string => {
+      const hit = modelMemo.get(s.id);
+      if (hit !== undefined) return hit;
+      const res = resolveSessionModel(s, liveRootSet.has(s.rootPath), modelsCache);
+      if (res.dirty) modelsCacheDirty = true;
+      modelMemo.set(s.id, res.model);
+      return res.model;
+    };
+
+    const primaryStats = getStats(primary);
+    const primaryModel = getModel(primary);
 
     // Child rollups for primary session
     let childToolCalls = 0;
@@ -3088,7 +3734,7 @@ export function runMonitor(
     for (const childId of primary.childIds) {
       const childSession = discovery.allById.get(childId);
       if (!childSession) continue;
-      const cStats = loadStats(childSession, cfg.cacheDir);
+      const cStats = getStats(childSession);
       childToolCalls += countTotalToolCalls(cStats);
       childTotalTokens += countTotalTokens(cStats);
     }
@@ -3113,7 +3759,7 @@ export function runMonitor(
       emit(`💬 ${truncate(summaryText, 80)}`, `size=12 ${CLR}`);
     }
 
-    emit(`🤖 ${primaryModelRes.model}`, `size=12 ${CLR}`);
+    emit(`🤖 ${primaryModel}`, `size=12 ${CLR}`);
 
     const stateTag =
       primary.liveness === 'working'
@@ -3205,14 +3851,45 @@ export function runMonitor(
       `size=12 ${CLR}`,
     );
 
+    // ── Model Usage (24h) ──
+    const cutoff24h = cfg.now - MODEL_USAGE_WINDOW_MS;
+    const recent24h = Array.from(discovery.allById.values())
+      .filter((s) => s.lastModifiedMs >= cutoff24h)
+      .sort((a, b) => b.lastModifiedMs - a.lastModifiedMs)
+      .slice(0, MAX_USAGE_RECENT_SESSIONS);
+
+    const usageCandidates: DiscoveredSession[] = [];
+    const seenCandidateIds = new Set<string>();
+    const addCandidate = (s: DiscoveredSession | undefined): void => {
+      if (!s || seenCandidateIds.has(s.id)) return;
+      seenCandidateIds.add(s.id);
+      usageCandidates.push(s);
+    };
+    addCandidate(primary);
+    for (const childId of primary.childIds) {
+      addCandidate(discovery.allById.get(childId));
+    }
+    for (const s of recent24h) {
+      addCandidate(s);
+    }
+    renderModelUsageSection(usageCandidates, getStats, getModel, quotasCache, cfg.now);
+
     // ── API / Quota Alerts ──
-    if (primaryStats.apiErrors.length > 0) {
+    const visibleApiErrors = filterVisibleApiErrors(primaryStats, cfg.now);
+    if (visibleApiErrors.length > 0) {
       sep();
-      emit(`⚠️ API / Quota Alerts (${primaryStats.apiErrors.length})`, `size=13 ${CLR_HEAD}`);
-      for (const err of primaryStats.apiErrors.slice(-5).reverse()) {
-        const prefix = err.isQuota ? '[QUOTA] ' : '';
+      emit(`⚠️ API / Quota Alerts (${visibleApiErrors.length})`, `size=13 ${CLR_HEAD}`);
+      const hasKnownModel = primaryModel !== 'unknown';
+      for (const err of visibleApiErrors.slice(-5).reverse()) {
+        const prefix = err.isQuota
+          ? hasKnownModel
+            ? `[QUOTA · ${primaryModel}] `
+            : '[QUOTA] '
+          : hasKnownModel
+            ? `[${primaryModel}] `
+            : '';
         emit(
-          `  ${formatTime(err.ts)} ${prefix}${truncate(err.message, 75)}`,
+          `  ${formatTime(err.ts)} ${prefix}${truncatePreservingAttempt(err.message, 75)}`,
           `size=11 font=Menlo ${CLR_SUB}`,
         );
       }
@@ -3298,6 +3975,8 @@ export function runMonitor(
       cfg.cacheDir,
       liveRootSet.has(primary.rootPath),
       modelsCache,
+      getStats,
+      getModel,
     );
     if (swarmRes.modelsDirty) modelsCacheDirty = true;
 
@@ -3360,6 +4039,8 @@ export function runMonitor(
       cfg.cacheDir,
       liveRootSet.has(primary.rootPath),
       modelsCache,
+      getStats,
+      getModel,
     );
     if (subRes.modelsDirty) modelsCacheDirty = true;
 
@@ -3568,16 +4249,11 @@ export function runMonitor(
       for (const s of otherRoots) {
         let oStats: SessionStats;
         try {
-          oStats = loadStats(s, cfg.cacheDir);
+          oStats = getStats(s);
         } catch {
           continue;
         }
-        const mRes = resolveSessionModel(
-          s,
-          liveRootSet.has(s.rootPath),
-          modelsCache,
-        );
-        if (mRes.dirty) modelsCacheDirty = true;
+        const oModel = getModel(s);
 
         const dot = sessionDot(s, cfg.now);
         const calls = countTotalToolCalls(oStats);
@@ -3589,7 +4265,7 @@ export function runMonitor(
             : 'idle';
 
         emit(
-          `--${dot} ${s.workspace.repo} · ${s.surface} · ${mRes.model}`,
+          `--${dot} ${s.workspace.repo} · ${s.surface} · ${oModel}`,
           `${actionParams(['pin', s.id], cfg.wrapperPath)} size=12 ${CLR}`,
         );
         emit(
@@ -3608,6 +4284,9 @@ export function runMonitor(
 
     if (modelsCacheDirty) {
       writeModelsCache(cfg.cacheDir, modelsCache);
+    }
+    if (quotasCacheDirty) {
+      writeQuotasCache(cfg.cacheDir, quotasCache);
     }
 
     try {

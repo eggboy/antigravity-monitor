@@ -13,7 +13,8 @@
 - **Live context window and compactions**: current context fill (`input_tokens + cache_read_tokens` on the latest planner turn), peak fill, prompt-cache hit rate, and `CHECKPOINT` compaction count.
 - **Token breakdown and child rollups**: cumulative input, cache-read, and output tokens for the root conversation, plus rolled-up tokens and tool calls from child subagents and swarm workers.
 - **Tool calls and failure separation**: per-tool call counts that split command or tool errors from macOS Seatbelt sandbox blocks (`BypassSandbox` retries).
-- **API and quota alerts**: `ERROR_MESSAGE` events (`RESOURCE_EXHAUSTED`, rate limits) with a menu bar warning badge if the latest step failed.
+- **24h model usage and remaining quota**: 24-hour token and turn totals grouped by canonical model name across recent sessions, plus remaining quota percentages and reset timers from local `swarm` snapshots when unexpired.
+- **API and quota alerts**: unresolved `ERROR_MESSAGE` events and recent quota hits tagged with the session model, stripping retry URL noise and hiding recovered transient errors.
 - **Plan and artifacts**: clickable links to Markdown artifacts in `brain/<id>/` and GFM task progress (`- [ ]`, `- [/]`, `- [x]`) from session plans, `PLAN.md`, and `task.md`.
 - **Native swarms and subagents**: worker names, roles, models, phases (`RUNNING`, `WAITING`, `KILLED`), board sequence numbers, `[stall]` or `[done]` tags, unread lag, and subagent runs. Click a worker or subagent to pin it.
 - **Skills, inbox, tasks, and customizations**: invoked skills, unread agent messages, background task logs, repo and global rule files (`AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.agents/rules`), hooks, and enabled, working MCP servers.
